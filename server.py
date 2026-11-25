@@ -366,7 +366,7 @@ def build_nutriguide_request(payload):
     user_profile = payload.get("userProfile")
     if isinstance(user_profile, dict):
         age = user_profile.get("age")
-        if age is None or (isinstance(age, (int, float)) and not isinstance(age, bool) and age < 18):
+        if not isinstance(age, int) or isinstance(age, bool) or age < 18 or age > 120:
             is_youth_safe = True
 
     contents = []
@@ -556,7 +556,7 @@ class NutriSnapHandler(http.server.SimpleHTTPRequestHandler):
                 "service": "NutriSnap AI Backend",
                 "status": "ok",
                 "mode": "backend-only",
-                "version": "1.5.1",
+                "version": "1.5.3",
                 "hasBackendKey": has_env_key,
                 "defaultModel": "gemini-4-hydrogen",
                 "endpoints": [
@@ -659,12 +659,23 @@ class NutriSnapHandler(http.server.SimpleHTTPRequestHandler):
         # Endpoint to report backend capability, health, and status
         if path_only in ['/api/config', '/api/health']:
             has_env_key = bool(os.environ.get("GEMINI_API_KEY", "").strip())
+            env_vision_model = os.environ.get("GEMINI_VISION_MODEL", "").strip()
+            configured_model = env_vision_model or "gemini-4-hydrogen"
+            model_config_valid = (
+                configured_model in SUPPORTED_MODELS or configured_model in LEGACY_MODEL_MAP
+            )
+            default_model = (
+                SUPPORTED_MODELS.get(configured_model)
+                or LEGACY_MODEL_MAP.get(configured_model)
+                or configured_model
+            )
             self.send_json(200, {
                 "status": "healthy" if path_only == '/api/health' else "ok",
                 "healthy": True,
-                "version": "1.5.1",
-                "hasBackendKey": has_env_key,
-                "defaultModel": "gemini-4-hydrogen",
+                "version": "1.5.3",
+                "hasBackendKey": bool(has_env_key),
+                "modelConfigValid": bool(model_config_valid),
+                "defaultModel": default_model,
                 "supportedModels": list(SUPPORTED_MODELS.keys()),
                 "rateLimit": f"{RATE_LIMIT_MAX_REQUESTS} req/{RATE_LIMIT_WINDOW_SECONDS}s"
             }, include_body=include_body)
