@@ -1,0 +1,18 @@
+# Render Blueprint Specification for NutriSnap Backend API
+# Deploys strictly on Render's $0/month Free Web Service tier (no paid plans enabled).
+# IMPORTANT: Service name must be globally unique on *.onrender.com.
+# Do NOT paste GEMINI_API_KEY into this file; set it privately in Render's Environment dashboard.
+services:
+  - type: web
+    name: nutrisnap-india-api
+    runtime: python
+    plan: free
+    buildCommand: python3 --version
+    startCommand: python3 server.py
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: PYTHONUNBUFFERED
+        value: "1"

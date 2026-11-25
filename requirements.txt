@@ -1,0 +1,2 @@
+# NutriSnap AI Production Backend
+# Zero external pip dependencies required - runs on standard library
