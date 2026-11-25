@@ -49,6 +49,79 @@ LEGACY_MODEL_MAP = {
     "gemini-1.5-pro": "gemini-4-hydrogen",
     "gemini-pro-vision": "gemini-4-hydrogen"
 }
+VISION_FALLBACK_MODELS = ["gemini-3.5-flash-lite", "gemini-4-hydrogen"]
+NUTRIGUIDE_FALLBACK_MODELS = ["gemini-3.5-flash-lite", "gemini-2.5-flash", "gemini-4-hydrogen"]
+TRANSIENT_HTTP_CODES = {404, 429, 500, 502, 503, 504}
+
+
+def build_model_candidates(primary_model, fallbacks):
+    """Build an ordered, deduplicated list of candidate Gemini models starting with primary_model."""
+    seen = set()
+    ordered = []
+    for m in [primary_model] + list(fallbacks or []):
+        clean = (m or "").strip()
+        if clean and clean not in seen:
+            seen.add(clean)
+            ordered.append(clean)
+    return ordered
+
+
+def call_gemini_with_fallback(api_key, candidate_models, gemini_payload, timeout=20, max_retries_single=1):
+    """Call Gemini generateContent with automatic model failover on transient overload/timeouts."""
+    payload_bytes = json.dumps(gemini_payload).encode('utf-8')
+    models = candidate_models or ["gemini-4-hydrogen"]
+    attempts_per_model = 1 + max_retries_single if len(models) == 1 else 1
+    last_err = {"kind": "internal", "code": 500, "message": "Unknown Gemini upstream failure"}
+
+    for idx, model_name in enumerate(models):
+        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+        for attempt in range(attempts_per_model):
+            req = urllib.request.Request(
+                endpoint,
+                data=payload_bytes,
+                headers={
+                    "Content-Type": "application/json",
+                    "x-goog-api-key": api_key
+                },
+                method='POST'
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as response:
+                    result_bytes = response.read()
+                parsed = json.loads(result_bytes.decode('utf-8'))
+                if not isinstance(parsed, dict):
+                    raise ValueError("Gemini API returned non-object JSON payload")
+                return parsed, model_name, None
+            except urllib.error.HTTPError as he:
+                error_body = he.read().decode('utf-8', errors='ignore')
+                err_msg = f"Gemini API HTTP {he.code}"
+                try:
+                    err_json = json.loads(error_body)
+                    err_msg = err_json.get("error", {}).get("message", err_msg)
+                except Exception:
+                    if error_body:
+                        err_msg = f"Gemini API error ({he.code}): {error_body[:200]}"
+                last_err = {"kind": "http", "code": he.code, "message": err_msg}
+                if he.code not in TRANSIENT_HTTP_CODES:
+                    return None, model_name, last_err
+                if attempt < attempts_per_model - 1:
+                    time.sleep(0.5)
+                    continue
+                if idx < len(models) - 1:
+                    break
+            except (urllib.error.URLError, TimeoutError, socket.timeout) as ne:
+                detail = getattr(ne, 'reason', None) or str(ne)
+                last_err = {"kind": "network", "code": 504, "message": str(detail)}
+                if attempt < attempts_per_model - 1:
+                    time.sleep(0.5)
+                    continue
+                if idx < len(models) - 1:
+                    break
+            except Exception as ex:
+                last_err = {"kind": "internal", "code": 500, "message": str(ex)}
+                return None, model_name, last_err
+
+    return None, models[-1], last_err
 
 def get_local_ip():
     """Retrieve the primary local network IP address of this computer."""
@@ -216,6 +289,21 @@ class NutriSnapHandler(http.server.SimpleHTTPRequestHandler):
         if error_type:
             err_obj["errorType"] = error_type
         self.send_json(status_code, {"error": err_obj}, include_body=include_body)
+
+    def _send_upstream_gemini_error(self, err_info, context_label):
+        """Map structured upstream Gemini failure into safe, redacted JSON HTTP error."""
+        kind = (err_info or {}).get("kind")
+        msg = _redact_secrets((err_info or {}).get("message", "Unknown upstream error"))
+        if kind == "http":
+            code = err_info.get("code", 502)
+            out_status = code if code in [400, 401, 403, 429] else 502
+            err_type = "api_auth_error" if code in [401, 403] else ("api_quota_error" if code == 429 else "api_error")
+            self.send_json_error(out_status, msg, upstream_code=code, error_type=err_type)
+            return
+        if kind == "network":
+            self.send_json_error(504, f"Network error contacting {context_label}: {msg}", error_type="network_error")
+            return
+        self.send_json_error(500, f"Internal {context_label} error: {msg}", error_type="server_error")
 
     def _read_json_object(self, max_bytes, too_large_msg):
         raw_len = self.headers.get('Content-Length')
@@ -648,105 +736,67 @@ class NutriSnapHandler(http.server.SimpleHTTPRequestHandler):
                 }
             }
 
-            endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{selected_model}:generateContent"
+            candidate_models = build_model_candidates(selected_model, VISION_FALLBACK_MODELS)
+            gemini_response, used_model, err_info = call_gemini_with_fallback(
+                active_key,
+                candidate_models,
+                gemini_payload,
+                timeout=20
+            )
+            if err_info is not None:
+                self._send_upstream_gemini_error(err_info, "Gemini API")
+                return
 
-            # Upstream Call with Exponential Backoff Retry (Max 2 retries for transient 429/503)
-            max_retries = 2
-            backoff_delays = [1.0, 2.0]
-            last_http_error = None
+            try:
+                raw_text = gemini_response.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                if not raw_text:
+                    raise ValueError("Empty response received from Gemini model")
 
-            for attempt in range(max_retries + 1):
-                try:
-                    gemini_payload_bytes = json.dumps(gemini_payload).encode('utf-8')
-                    req = urllib.request.Request(
-                        endpoint,
-                        data=gemini_payload_bytes,
-                        headers={
-                            "Content-Type": "application/json",
-                            "x-goog-api-key": active_key
-                        }
-                    )
+                clean_text = raw_text.strip()
+                if clean_text.startswith("```json"):
+                    clean_text = clean_text[7:]
+                if clean_text.startswith("```"):
+                    clean_text = clean_text[3:]
+                if clean_text.endswith("```"):
+                    clean_text = clean_text[:-3]
+                clean_text = clean_text.strip()
 
-                    with urllib.request.urlopen(req, timeout=30) as response:
-                        result_bytes = response.read()
+                parsed_result = json.loads(clean_text)
+                if not isinstance(parsed_result, dict):
+                    raise ValueError("Gemini model returned non-object JSON payload")
+                parsed_result["source"] = f"Gemini Vision Proxy ({used_model})"
 
-                    gemini_response = json.loads(result_bytes.decode('utf-8'))
-                    raw_text = gemini_response.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-                    if not raw_text:
-                        raise ValueError("Empty response received from Gemini model")
-
-                    clean_text = raw_text.strip()
-                    if clean_text.startswith("```json"):
-                        clean_text = clean_text[7:]
-                    if clean_text.startswith("```"):
-                        clean_text = clean_text[3:]
-                    if clean_text.endswith("```"):
-                        clean_text = clean_text[:-3]
-                    clean_text = clean_text.strip()
-
-                    parsed_result = json.loads(clean_text)
-                    if not isinstance(parsed_result, dict):
-                        raise ValueError("Gemini model returned non-object JSON payload")
-                    parsed_result["source"] = f"Gemini Vision Proxy ({selected_model})"
-
-                    if scan_type == "nutrition_label":
-                        parsed_result["scanType"] = "nutrition_label"
-                        parsed_result["isUserConfirmed"] = False
-                        parsed_result["allergenNotice"] = "⚠️ Allergen Notice: Allergen information is extracted from packaging text. Always check physical packaging before consumption. NutriSnap cannot guarantee allergen safety."
-                        if not isinstance(parsed_result.get("uncertainFields"), list):
-                            parsed_result["uncertainFields"] = []
+                if scan_type == "nutrition_label":
+                    parsed_result["scanType"] = "nutrition_label"
+                    parsed_result["isUserConfirmed"] = False
+                    parsed_result["allergenNotice"] = "⚠️ Allergen Notice: Allergen information is extracted from packaging text. Always check physical packaging before consumption. NutriSnap cannot guarantee allergen safety."
+                    if not isinstance(parsed_result.get("uncertainFields"), list):
+                        parsed_result["uncertainFields"] = []
+                else:
+                    # Ensure confidence integrity: strip fake or invalid confidence numbers
+                    raw_conf = parsed_result.get("confidence")
+                    if isinstance(raw_conf, (int, float)) and 0.0 <= raw_conf <= 1.0:
+                        parsed_result["confidence"] = round(float(raw_conf), 2)
                     else:
-                        # Ensure confidence integrity: strip fake or invalid confidence numbers
-                        raw_conf = parsed_result.get("confidence")
-                        if isinstance(raw_conf, (int, float)) and 0.0 <= raw_conf <= 1.0:
-                            parsed_result["confidence"] = round(float(raw_conf), 2)
-                        else:
-                            parsed_result["confidence"] = None
+                        parsed_result["confidence"] = None
 
-                        # Ensure coordinate_format is present
-                        if "coordinate_format" not in parsed_result:
-                            parsed_result["coordinate_format"] = "normalized_0_to_1000"
+                    # Ensure coordinate_format is present
+                    if "coordinate_format" not in parsed_result:
+                        parsed_result["coordinate_format"] = "normalized_0_to_1000"
 
-                        # Ensure items array structure
-                        if not isinstance(parsed_result.get("items"), list):
-                            parsed_result["items"] = []
+                    # Ensure items array structure
+                    if not isinstance(parsed_result.get("items"), list):
+                        parsed_result["items"] = []
 
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'application/json')
-                    self.end_headers()
-                    self.wfile.write(json.dumps(parsed_result).encode('utf-8'))
-                    return
-
-                except urllib.error.HTTPError as he:
-                    last_http_error = he
-                    if he.code in [429, 503] and attempt < max_retries:
-                        time.sleep(backoff_delays[attempt])
-                        continue
-                    break
-                except Exception as ex:
-                    last_http_error = ex
-                    break
-
-            # Handle errors after retry exhaustion
-            if isinstance(last_http_error, urllib.error.HTTPError):
-                error_body = last_http_error.read().decode('utf-8', errors='ignore')
-                err_msg = f"Gemini API HTTP {last_http_error.code}"
-                try:
-                    err_json = json.loads(error_body)
-                    err_msg = err_json.get("error", {}).get("message", err_msg)
-                except Exception:
-                    pass
-                out_status = last_http_error.code if last_http_error.code in [400, 401, 403, 429] else 502
-                err_type = "api_auth_error" if last_http_error.code in [401, 403] else ("api_quota_error" if last_http_error.code == 429 else "api_error")
-                self.send_json_error(out_status, _redact_secrets(err_msg), upstream_code=last_http_error.code, error_type=err_type)
+                self.send_json(200, parsed_result)
                 return
-
-            if isinstance(last_http_error, urllib.error.URLError):
-                self.send_json_error(504, f"Network error contacting Gemini API: {_redact_secrets(last_http_error.reason)}", error_type="network_error")
+            except Exception as parse_err:
+                self.send_json_error(
+                    500,
+                    f"Internal meal analysis error: {_redact_secrets(parse_err)}",
+                    error_type="server_error"
+                )
                 return
-
-            self.send_json_error(500, f"Internal meal analysis error: {_redact_secrets(last_http_error)}", error_type="server_error")
-            return
 
         elif path_only == '/api/nutriguide':
             client_ip = self.get_client_ip()
@@ -788,65 +838,40 @@ class NutriSnapHandler(http.server.SimpleHTTPRequestHandler):
             gemini_payload = built_req["gemini_payload"]
             is_youth_safe = built_req["is_youth_safe"]
 
-            model_name = os.environ.get("GEMINI_NUTRIGUIDE_MODEL", "").strip() or "gemini-3.8-flash"
-            gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+            primary_guide_model = os.environ.get("GEMINI_NUTRIGUIDE_MODEL", "").strip() or "gemini-3.8-flash"
+            candidate_guide_models = build_model_candidates(primary_guide_model, NUTRIGUIDE_FALLBACK_MODELS)
 
-            last_guide_err = None
-            for attempt in range(2):
-                req = urllib.request.Request(
-                    gemini_url,
-                    data=json.dumps(gemini_payload).encode('utf-8'),
-                    headers={
-                        'Content-Type': 'application/json',
-                        'x-goog-api-key': active_key
-                    },
-                    method='POST'
-                )
-                try:
-                    with urllib.request.urlopen(req, timeout=30) as response:
-                        raw_resp = response.read().decode('utf-8')
-                        gemini_data = json.loads(raw_resp)
-                        reply_text = ""
-                        if isinstance(gemini_data, dict):
-                            candidates = gemini_data.get("candidates", [])
-                            if isinstance(candidates, list) and candidates:
-                                parts = (candidates[0] or {}).get("content", {}).get("parts", [])
-                                if isinstance(parts, list):
-                                    reply_text = "".join(p.get("text", "") for p in parts if isinstance(p, dict) and isinstance(p.get("text"), str))
-
-                        reply_text = reply_text.strip()
-                        if not reply_text:
-                            reply_text = "I'm sorry, I couldn't generate a response. Please try asking your question differently."
-                        elif len(reply_text) > 12000:
-                            reply_text = reply_text[:12000]
-
-                        self.send_json(200, {
-                            "status": "ok",
-                            "reply": reply_text,
-                            "isYouthSafe": is_youth_safe,
-                            "safetyEnforcedIndependently": True
-                        })
-                        return
-                except urllib.error.HTTPError as he:
-                    last_guide_err = he
-                    if he.code in [429, 503] and attempt == 0:
-                        time.sleep(1.0)
-                        continue
-                    break
-                except Exception as e:
-                    last_guide_err = e
-                    if attempt == 0 and isinstance(e, urllib.error.URLError):
-                        time.sleep(0.5)
-                        continue
-                    break
-
-            if isinstance(last_guide_err, urllib.error.HTTPError):
-                err_text = last_guide_err.read().decode('utf-8', errors='ignore')
-                status = last_guide_err.code if last_guide_err.code in [400, 401, 403, 429] else 502
-                err_type = "api_auth_error" if last_guide_err.code in [401, 403] else ("api_quota_error" if last_guide_err.code == 429 else "api_error")
-                self.send_json_error(status, f"Gemini API error ({last_guide_err.code}): {_redact_secrets(err_text)[:200]}", upstream_code=last_guide_err.code, error_type=err_type)
+            gemini_data, used_model, err_info = call_gemini_with_fallback(
+                active_key,
+                candidate_guide_models,
+                gemini_payload,
+                timeout=20
+            )
+            if err_info is not None:
+                self._send_upstream_gemini_error(err_info, "NutriGuide assistant")
                 return
-            self.send_json_error(504, f"Network error contacting NutriGuide assistant: {_redact_secrets(last_guide_err)}", error_type="network_error")
+
+            reply_text = ""
+            if isinstance(gemini_data, dict):
+                candidates = gemini_data.get("candidates", [])
+                if isinstance(candidates, list) and candidates:
+                    parts = (candidates[0] or {}).get("content", {}).get("parts", [])
+                    if isinstance(parts, list):
+                        reply_text = "".join(p.get("text", "") for p in parts if isinstance(p, dict) and isinstance(p.get("text"), str))
+
+            reply_text = reply_text.strip()
+            if not reply_text:
+                reply_text = "I'm sorry, I couldn't generate a response. Please try asking your question differently."
+            elif len(reply_text) > 12000:
+                reply_text = reply_text[:12000]
+
+            self.send_json(200, {
+                "status": "ok",
+                "reply": reply_text,
+                "isYouthSafe": is_youth_safe,
+                "safetyEnforcedIndependently": True,
+                "model": used_model
+            })
             return
 
         self.send_response(404)
