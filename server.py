@@ -62,9 +62,9 @@ VISION_FALLBACK_MODELS = [
 ]
 NUTRIGUIDE_FALLBACK_MODELS = [
     "gemini-3.5-flash-lite",
+    "gemini-3.5-flash",
     "gemini-3.6-flash",
     "gemini-3.7-flash",
-    "gemini-3.5-flash",
     "gemini-2.5-flash-lite",
     "gemini-2.5-flash",
     "gemini-2.0-flash",
@@ -148,6 +148,38 @@ def discover_gemini_models(api_key, timeout=5):
     return found
 
 
+def extract_gemini_text(gemini_data):
+    """Extract only visible model answer text, skipping internal thought/reasoning parts."""
+    if not isinstance(gemini_data, dict):
+        return ""
+    candidates = gemini_data.get("candidates", [])
+    if not isinstance(candidates, list) or not candidates:
+        return ""
+    content = (candidates[0] or {}).get("content", {})
+    parts = content.get("parts", []) if isinstance(content, dict) else []
+    if not isinstance(parts, list):
+        return ""
+    return "".join(
+        p.get("text", "")
+        for p in parts
+        if isinstance(p, dict) and not p.get("thought") and isinstance(p.get("text"), str)
+    ).strip()
+
+
+def _build_model_payload(gemini_payload, model_name, include_thinking_config=True):
+    """Clone Gemini payload and attach safe minimal thinkingConfig appropriate for model_name."""
+    cloned = dict(gemini_payload)
+    gen_cfg = dict(gemini_payload.get("generationConfig") or {})
+    if include_thinking_config and "thinkingConfig" not in gen_cfg:
+        low = (model_name or "").lower()
+        if low.startswith("gemini-2.5-flash"):
+            gen_cfg["thinkingConfig"] = {"thinkingBudget": 0}
+        elif low.startswith(("gemini-3", "gemini-4")):
+            gen_cfg["thinkingConfig"] = {"thinkingLevel": "low"}
+    cloned["generationConfig"] = gen_cfg
+    return cloned
+
+
 def call_gemini_with_fallback(
     api_key,
     candidate_models,
@@ -158,7 +190,6 @@ def call_gemini_with_fallback(
     discover_on_exhaust=True
 ):
     """Call Gemini generateContent with automatic model failover, timeout budget, and live model discovery."""
-    payload_bytes = json.dumps(gemini_payload).encode('utf-8')
     models = list(candidate_models or ["gemini-4-hydrogen"])
     deadline = time.monotonic() + float(total_budget)
     attempts_per_model = 1 + max_retries_single if len(models) == 1 else 1
@@ -169,11 +200,14 @@ def call_gemini_with_fallback(
     def _try_model(model_name, max_attempts):
         nonlocal last_err
         endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+        use_thinking_cfg = True
         for attempt in range(max_attempts):
             remaining = deadline - time.monotonic()
             if remaining <= 1.0:
                 return None, True
             req_timeout = min(float(timeout), max(2.0, remaining))
+            payload_obj = _build_model_payload(gemini_payload, model_name, include_thinking_config=use_thinking_cfg)
+            payload_bytes = json.dumps(payload_obj).encode('utf-8')
             req = urllib.request.Request(
                 endpoint,
                 data=payload_bytes,
@@ -189,6 +223,9 @@ def call_gemini_with_fallback(
                 parsed = json.loads(result_bytes.decode('utf-8'))
                 if not isinstance(parsed, dict):
                     raise ValueError("Gemini API returned non-object JSON payload")
+                if not extract_gemini_text(parsed):
+                    last_err = {"kind": "http", "code": 502, "message": "Gemini model produced no visible text"}
+                    return None, False
                 return parsed, False
             except urllib.error.HTTPError as he:
                 error_body = he.read().decode('utf-8', errors='ignore')
@@ -199,6 +236,23 @@ def call_gemini_with_fallback(
                 except Exception:
                     if error_body:
                         err_msg = f"Gemini API error ({he.code}): {error_body[:200]}"
+                if he.code == 400 and use_thinking_cfg and "thinking" in err_msg.lower():
+                    # Model variant rejected thinkingConfig: retry once immediately without it
+                    use_thinking_cfg = False
+                    payload_obj = _build_model_payload(gemini_payload, model_name, include_thinking_config=False)
+                    retry_req = urllib.request.Request(
+                        endpoint,
+                        data=json.dumps(payload_obj).encode('utf-8'),
+                        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+                        method='POST'
+                    )
+                    try:
+                        with urllib.request.urlopen(retry_req, timeout=req_timeout) as retry_resp:
+                            retry_parsed = json.loads(retry_resp.read().decode('utf-8'))
+                        if isinstance(retry_parsed, dict) and extract_gemini_text(retry_parsed):
+                            return retry_parsed, False
+                    except Exception:
+                        pass
                 last_err = {"kind": "http", "code": he.code, "message": err_msg}
                 if he.code not in TRANSIENT_HTTP_CODES:
                     return None, True
@@ -350,6 +404,7 @@ def build_nutriguide_request(payload):
         "4. ACCURACY: Never fabricate fake nutritional facts, invented statistics, or unverified claims. Base Indian food context on standard ICMR-NIN composition knowledge.\n"
         "5. LANGUAGE: Communicate exclusively in clear, accessible English.\n"
         "6. NON-JUDGMENTAL: Never label traditional foods as 'sinful', 'guilt-ridden', or 'bad'.\n"
+        "7. RESPONSE FORMAT: Reply directly to the user in a clear, concise, practical way (~120-260 words unless more detail is requested) using short paragraphs and clean bullet points. NEVER output meta-commentary, rule checklists, or self-verification notes about your instructions.\n"
     )
 
     if is_youth_safe:
@@ -368,7 +423,7 @@ def build_nutriguide_request(payload):
         },
         "generationConfig": {
             "temperature": 0.4,
-            "maxOutputTokens": 1000
+            "maxOutputTokens": 2500
         }
     }
     return {"gemini_payload": gemini_payload, "is_youth_safe": is_youth_safe}, None
@@ -850,7 +905,7 @@ class NutriSnapHandler(http.server.SimpleHTTPRequestHandler):
                 "generationConfig": {
                     "temperature": 0.2,
                     "topP": 0.8,
-                    "maxOutputTokens": 1024,
+                    "maxOutputTokens": 2048,
                     "responseMimeType": "application/json"
                 }
             }
@@ -867,7 +922,7 @@ class NutriSnapHandler(http.server.SimpleHTTPRequestHandler):
                 return
 
             try:
-                raw_text = gemini_response.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                raw_text = extract_gemini_text(gemini_response)
                 if not raw_text:
                     raise ValueError("Empty response received from Gemini model")
 
@@ -970,15 +1025,7 @@ class NutriSnapHandler(http.server.SimpleHTTPRequestHandler):
                 self._send_upstream_gemini_error(err_info, "NutriGuide assistant")
                 return
 
-            reply_text = ""
-            if isinstance(gemini_data, dict):
-                candidates = gemini_data.get("candidates", [])
-                if isinstance(candidates, list) and candidates:
-                    parts = (candidates[0] or {}).get("content", {}).get("parts", [])
-                    if isinstance(parts, list):
-                        reply_text = "".join(p.get("text", "") for p in parts if isinstance(p, dict) and isinstance(p.get("text"), str))
-
-            reply_text = reply_text.strip()
+            reply_text = extract_gemini_text(gemini_data)
             if not reply_text:
                 reply_text = "I'm sorry, I couldn't generate a response. Please try asking your question differently."
             elif len(reply_text) > 12000:
