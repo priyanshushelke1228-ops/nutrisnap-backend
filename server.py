@@ -320,6 +320,13 @@ def is_rate_limited(client_ip):
     """Check if a client IP has exceeded the request threshold (thread-safe)."""
     now = time.time()
     with rate_limit_lock:
+        if len(client_request_history) > 256:
+            stale_ips = [
+                ip for ip, timestamps in client_request_history.items()
+                if not any(now - t < RATE_LIMIT_WINDOW_SECONDS for t in timestamps)
+            ]
+            for ip in stale_ips:
+                del client_request_history[ip]
         history = client_request_history.get(client_ip, [])
         # Filter timestamps within the sliding window
         history = [t for t in history if now - t < RATE_LIMIT_WINDOW_SECONDS]
@@ -743,14 +750,16 @@ class NutriSnapHandler(http.server.SimpleHTTPRequestHandler):
 
             mime_type = "image/jpeg"
             clean_base64 = image_raw
-            if "base64," in image_raw:
-                header_part, clean_base64 = image_raw.split("base64,", 1)
-                clean_base64 = clean_base64.strip()
-                if "image/png" in header_part:
+            b64_marker_idx = image_raw.lower().find("base64,")
+            if b64_marker_idx != -1:
+                header_part = image_raw[:b64_marker_idx + len("base64,")]
+                clean_base64 = image_raw[b64_marker_idx + len("base64,"):]
+                header_lower = header_part.lower()
+                if "image/png" in header_lower:
                     mime_type = "image/png"
-                elif "image/webp" in header_part:
+                elif "image/webp" in header_lower:
                     mime_type = "image/webp"
-                elif "image/jpeg" in header_part or "image/jpg" in header_part:
+                elif "image/jpeg" in header_lower or "image/jpg" in header_lower:
                     mime_type = "image/jpeg"
                 else:
                     self.send_response(400)
@@ -761,9 +770,27 @@ class NutriSnapHandler(http.server.SimpleHTTPRequestHandler):
                     }).encode('utf-8'))
                     return
 
-            # Validate base64 integrity and decoded byte size (max 5MB)
+            # Strip whitespace and validate base64 integrity and decoded byte size (1B..5MB)
+            clean_base64 = "".join(clean_base64.split())
+            if not clean_base64:
+                self.send_response(400)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    "error": {"code": 400, "message": "Empty image data provided."}
+                }).encode('utf-8'))
+                return
+
             try:
-                decoded_image = base64.b64decode(clean_base64)
+                decoded_image = base64.b64decode(clean_base64, validate=True)
+                if len(decoded_image) == 0:
+                    self.send_response(400)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({
+                        "error": {"code": 400, "message": "Empty image data provided."}
+                    }).encode('utf-8'))
+                    return
                 if len(decoded_image) > 5 * 1024 * 1024:
                     self.send_response(413)
                     self.send_header('Content-Type', 'application/json')
@@ -782,7 +809,8 @@ class NutriSnapHandler(http.server.SimpleHTTPRequestHandler):
                 return
 
             # 5. Model Validation & Migration
-            requested_model = (payload.get("model") or "gemini-4-hydrogen").strip()
+            raw_model = payload.get("model")
+            requested_model = (raw_model.strip() if isinstance(raw_model, str) else "") or "gemini-4-hydrogen"
             if requested_model in LEGACY_MODEL_MAP:
                 selected_model = LEGACY_MODEL_MAP[requested_model]
             elif requested_model in SUPPORTED_MODELS:
@@ -791,7 +819,10 @@ class NutriSnapHandler(http.server.SimpleHTTPRequestHandler):
                 selected_model = "gemini-4-hydrogen"
 
             # 6. Structured Multimodal Food Analysis Instruction
-            scan_type = payload.get("scanType") or ("nutrition_label" if path_only == '/api/scan-label' else "meal")
+            raw_scan_type = payload.get("scanType")
+            scan_type = (raw_scan_type.strip() if isinstance(raw_scan_type, str) else "") or (
+                "nutrition_label" if path_only == '/api/scan-label' else "meal"
+            )
 
             if scan_type == "nutrition_label":
                 system_instruction = (
@@ -949,7 +980,7 @@ class NutriSnapHandler(http.server.SimpleHTTPRequestHandler):
                 else:
                     # Ensure confidence integrity: strip fake or invalid confidence numbers
                     raw_conf = parsed_result.get("confidence")
-                    if isinstance(raw_conf, (int, float)) and 0.0 <= raw_conf <= 1.0:
+                    if not isinstance(raw_conf, bool) and isinstance(raw_conf, (int, float)) and 0.0 <= raw_conf <= 1.0:
                         parsed_result["confidence"] = round(float(raw_conf), 2)
                     else:
                         parsed_result["confidence"] = None
