@@ -26,6 +26,7 @@ import re
 import base64
 import urllib.request
 import urllib.error
+import urllib.parse
 import webbrowser
 
 PORT = int(os.environ.get("PORT", 8080))
@@ -198,21 +199,23 @@ class NutriSnapHandler(http.server.SimpleHTTPRequestHandler):
                 return real_ip.strip()[:64]
         return self.client_address[0] if self.client_address else "unknown"
 
-    def send_json(self, status_code, data):
+    def send_json(self, status_code, data, include_body=True):
         body = json.dumps(data).encode('utf-8')
         self.send_response(status_code)
         self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        if include_body:
+            self.wfile.write(body)
 
-    def send_json_error(self, status_code, message, upstream_code=None, error_type=None):
+    def send_json_error(self, status_code, message, upstream_code=None, error_type=None, include_body=True):
         err_obj = {
             "code": upstream_code if upstream_code is not None else status_code,
             "message": message
         }
         if error_type:
             err_obj["errorType"] = error_type
-        self.send_json(status_code, {"error": err_obj})
+        self.send_json(status_code, {"error": err_obj}, include_body=include_body)
 
     def _read_json_object(self, max_bytes, too_large_msg):
         raw_len = self.headers.get('Content-Length')
@@ -259,30 +262,135 @@ class NutriSnapHandler(http.server.SimpleHTTPRequestHandler):
         self.send_response(204)
         self.end_headers()
 
-    def do_GET(self):
-        path_only = self.path.split('?')[0]
+    def _is_backend_only(self):
+        """Return True when deployed without web frontend assets (no index.html)."""
+        base_dir = getattr(self, 'directory', None) or DIRECTORY
+        return not os.path.isfile(os.path.join(base_dir, 'index.html'))
 
+    def _is_blocked_static_path(self, path_only):
+        """Block dotfiles (.git, .env, .venv) and keystore files from static serving."""
+        decoded = urllib.parse.unquote(path_only or '')
+        segments = [seg for seg in decoded.replace('\\', '/').split('/') if seg]
+        for seg in segments:
+            if seg.startswith('.') or seg.lower().endswith(('.keystore', '.pem')):
+                return True
+        return False
+
+    def _send_backend_status_page(self, include_body=True):
+        """Serve a clean status page (or JSON if requested) at / in backend-only mode."""
+        has_env_key = bool(os.environ.get("GEMINI_API_KEY", "").strip())
+        hdrs = getattr(self, 'headers', None)
+        accept = (hdrs.get('Accept', '') if hdrs else '').lower()
+
+        if 'application/json' in accept and 'text/html' not in accept:
+            payload = {
+                "service": "NutriSnap AI Backend",
+                "status": "ok",
+                "mode": "backend-only",
+                "version": "1.5.1",
+                "hasBackendKey": has_env_key,
+                "defaultModel": "gemini-4-hydrogen",
+                "endpoints": [
+                    "/api/health",
+                    "/api/config",
+                    "/api/analyze-meal",
+                    "/api/scan-label",
+                    "/api/nutriguide"
+                ]
+            }
+            self.send_json(200, payload, include_body=include_body)
+            return
+
+        key_badge = (
+            '<span class="badge ok">GEMINI_API_KEY Active</span>'
+            if has_env_key
+            else '<span class="badge warn">GEMINI_API_KEY Not Set</span>'
+        )
+        html_doc = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NutriSnap AI — Backend API</title>
+  <style>
+    :root {{ color-scheme: dark; }}
+    body {{
+      margin: 0; font-family: system-ui, -apple-system, sans-serif;
+      background: #0f172a; color: #e2e8f0;
+      display: grid; place-items: center; min-height: 100vh; padding: 24px;
+    }}
+    .card {{
+      max-width: 560px; width: 100%; background: #1e293b;
+      border: 1px solid #334155; border-radius: 16px; padding: 28px;
+      box-shadow: 0 20px 45px rgba(0, 0, 0, 0.35);
+    }}
+    h1 {{ margin: 0 0 8px; font-size: 1.35rem; color: #f8fafc; }}
+    p {{ margin: 0 0 18px; color: #94a3b8; line-height: 1.5; font-size: 0.95rem; }}
+    .row {{ display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 20px; }}
+    .badge {{
+      display: inline-block; padding: 4px 10px; border-radius: 999px;
+      font-size: 0.78rem; font-weight: 600; background: #334155; color: #e2e8f0;
+    }}
+    .badge.ok {{ background: rgba(16, 185, 129, 0.18); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.35); }}
+    .badge.warn {{ background: rgba(245, 158, 11, 0.18); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.35); }}
+    ul {{ list-style: none; padding: 0; margin: 0; display: grid; gap: 8px; }}
+    li {{
+      display: flex; justify-content: space-between; gap: 12px; align-items: center;
+      background: #0f172a; border: 1px solid #334155; border-radius: 10px;
+      padding: 10px 12px; font-size: 0.88rem;
+    }}
+    code {{ font-family: ui-monospace, SFMono-Regular, monospace; color: #38bdf8; }}
+    a {{ color: #38bdf8; text-decoration: none; }}
+    a:hover {{ text-decoration: underline; }}
+    .method {{ font-size: 0.75rem; font-weight: 700; color: #94a3b8; }}
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>NutriSnap AI — Backend API</h1>
+    <p>This service runs in <strong>backend-only</strong> mode for the NutriSnap mobile and web clients. No web UI or directory listing is served at <code>/</code>.</p>
+    <div class="row">
+      <span class="badge ok">API Online · v1.5.1</span>
+      {key_badge}
+    </div>
+    <ul>
+      <li><a href="/api/health"><code>/api/health</code></a><span class="method">GET</span></li>
+      <li><a href="/api/config"><code>/api/config</code></a><span class="method">GET</span></li>
+      <li><code>/api/analyze-meal</code><span class="method">POST</span></li>
+      <li><code>/api/scan-label</code><span class="method">POST</span></li>
+      <li><code>/api/nutriguide</code><span class="method">POST</span></li>
+    </ul>
+  </main>
+</body>
+</html>"""
+        body = html_doc.encode('utf-8')
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        if include_body:
+            self.wfile.write(body)
+
+    def list_directory(self, path):
+        """Never expose raw filesystem directory listings."""
+        self.send_json_error(404, "Directory listing is disabled.")
+        return None
+
+    def _serve_api_get(self, path_only, include_body=True):
         # Endpoint to return the server's LAN IP for the Android QR code modal
         if path_only == '/api/server-info':
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
             local_ip = get_local_ip()
-            response_json = json.dumps({
+            self.send_json(200, {
                 "localIp": local_ip,
                 "port": PORT,
                 "wifiUrl": f"http://{local_ip}:{PORT}"
-            })
-            self.wfile.write(response_json.encode('utf-8'))
-            return
+            }, include_body=include_body)
+            return True
 
         # Endpoint to report backend capability, health, and status
         if path_only in ['/api/config', '/api/health']:
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
             has_env_key = bool(os.environ.get("GEMINI_API_KEY", "").strip())
-            response_json = json.dumps({
+            self.send_json(200, {
                 "status": "healthy" if path_only == '/api/health' else "ok",
                 "healthy": True,
                 "version": "1.5.1",
@@ -290,11 +398,42 @@ class NutriSnapHandler(http.server.SimpleHTTPRequestHandler):
                 "defaultModel": "gemini-4-hydrogen",
                 "supportedModels": list(SUPPORTED_MODELS.keys()),
                 "rateLimit": f"{RATE_LIMIT_MAX_REQUESTS} req/{RATE_LIMIT_WINDOW_SECONDS}s"
-            })
-            self.wfile.write(response_json.encode('utf-8'))
+            }, include_body=include_body)
+            return True
+
+        return False
+
+    def _handle_static_or_backend_root(self, include_body=True):
+        """Route GET and HEAD consistently across API endpoints, backend-only root, and local static files."""
+        path_only = self.path.split('?')[0]
+        if self._serve_api_get(path_only, include_body=include_body):
             return
 
-        return super().do_GET()
+        if self._is_blocked_static_path(path_only):
+            self.send_json_error(404, "Not found.", include_body=include_body)
+            return
+
+        if self._is_backend_only():
+            if path_only in ['', '/']:
+                self._send_backend_status_page(include_body=include_body)
+                return
+            self.send_json_error(
+                404,
+                "Not found. This server runs in backend-only mode with API endpoints under /api/*.",
+                include_body=include_body
+            )
+            return
+
+        if include_body:
+            super().do_GET()
+        else:
+            super().do_HEAD()
+
+    def do_HEAD(self):
+        self._handle_static_or_backend_root(include_body=False)
+
+    def do_GET(self):
+        self._handle_static_or_backend_root(include_body=True)
 
     def do_POST(self):
         path_only = self.path.split('?')[0]
@@ -649,7 +788,7 @@ class NutriSnapHandler(http.server.SimpleHTTPRequestHandler):
             gemini_payload = built_req["gemini_payload"]
             is_youth_safe = built_req["is_youth_safe"]
 
-            model_name = (os.environ.get("GEMINI_NUTRIGUIDE_MODEL") or "gemini-2.5-flash").strip() or "gemini-2.5-flash"
+            model_name = os.environ.get("GEMINI_NUTRIGUIDE_MODEL", "").strip() or "gemini-3.8-flash"
             gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
 
             last_guide_err = None
