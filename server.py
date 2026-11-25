@@ -23,6 +23,7 @@ import json
 import time
 import threading
 import re
+import hashlib
 import base64
 import urllib.request
 import urllib.error
@@ -49,16 +50,43 @@ LEGACY_MODEL_MAP = {
     "gemini-1.5-pro": "gemini-4-hydrogen",
     "gemini-pro-vision": "gemini-4-hydrogen"
 }
-VISION_FALLBACK_MODELS = ["gemini-3.5-flash-lite", "gemini-4-hydrogen"]
-NUTRIGUIDE_FALLBACK_MODELS = ["gemini-3.5-flash-lite", "gemini-2.5-flash", "gemini-4-hydrogen"]
+VISION_FALLBACK_MODELS = [
+    "gemini-3.5-flash-lite",
+    "gemini-3.6-flash",
+    "gemini-3.7-flash",
+    "gemini-3.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-4-hydrogen"
+]
+NUTRIGUIDE_FALLBACK_MODELS = [
+    "gemini-3.5-flash-lite",
+    "gemini-3.6-flash",
+    "gemini-3.7-flash",
+    "gemini-3.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-4-hydrogen"
+]
 TRANSIENT_HTTP_CODES = {404, 429, 500, 502, 503, 504}
+EXCLUDED_DISCOVERED_TOKENS = (
+    "embedding", "tts", "imagen", "veo", "lyria", "aqa",
+    "audio", "live", "robotics", "computer-use", "deep-research", "image"
+)
+_discovered_models_cache = {"key_hash": "", "models": [], "expires_at": 0.0}
+_discovered_models_lock = threading.Lock()
 
 
 def build_model_candidates(primary_model, fallbacks):
     """Build an ordered, deduplicated list of candidate Gemini models starting with primary_model."""
+    env_fallbacks = [
+        item.strip() for item in os.environ.get("GEMINI_FALLBACK_MODELS", "").split(",") if item.strip()
+    ]
     seen = set()
     ordered = []
-    for m in [primary_model] + list(fallbacks or []):
+    for m in [primary_model] + env_fallbacks + list(fallbacks or []):
         clean = (m or "").strip()
         if clean and clean not in seen:
             seen.add(clean)
@@ -66,16 +94,86 @@ def build_model_candidates(primary_model, fallbacks):
     return ordered
 
 
-def call_gemini_with_fallback(api_key, candidate_models, gemini_payload, timeout=20, max_retries_single=1):
-    """Call Gemini generateContent with automatic model failover on transient overload/timeouts."""
+def discover_gemini_models(api_key, timeout=5):
+    """Query Google AI /v1beta/models (cached 10m) to discover available generateContent Gemini models."""
+    key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+    now = time.monotonic()
+    with _discovered_models_lock:
+        if (
+            _discovered_models_cache["key_hash"] == key_hash
+            and _discovered_models_cache["expires_at"] > now
+        ):
+            return list(_discovered_models_cache["models"])
+
+    req = urllib.request.Request(
+        "https://generativelanguage.googleapis.com/v1beta/models",
+        headers={"x-goog-api-key": api_key},
+        method="GET"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return []
+
+    found = []
+    for entry in (data.get("models") if isinstance(data, dict) else []) or []:
+        if not isinstance(entry, dict):
+            continue
+        methods = entry.get("supportedGenerationMethods") or []
+        if "generateContent" not in methods:
+            continue
+        raw_name = str(entry.get("name") or "")
+        model_id = raw_name.split("/", 1)[-1].strip()
+        lower = model_id.lower()
+        if not lower.startswith("gemini-"):
+            continue
+        if any(tok in lower for tok in EXCLUDED_DISCOVERED_TOKENS):
+            continue
+        found.append(model_id)
+
+    def _rank(name):
+        low = name.lower()
+        if "flash-lite" in low:
+            return (0, name)
+        if "flash" in low:
+            return (1, name)
+        return (2, name)
+
+    found.sort(key=_rank)
+    with _discovered_models_lock:
+        _discovered_models_cache["key_hash"] = key_hash
+        _discovered_models_cache["models"] = list(found)
+        _discovered_models_cache["expires_at"] = time.monotonic() + 600.0
+    return found
+
+
+def call_gemini_with_fallback(
+    api_key,
+    candidate_models,
+    gemini_payload,
+    timeout=12,
+    total_budget=42.0,
+    max_retries_single=1,
+    discover_on_exhaust=True
+):
+    """Call Gemini generateContent with automatic model failover, timeout budget, and live model discovery."""
     payload_bytes = json.dumps(gemini_payload).encode('utf-8')
-    models = candidate_models or ["gemini-4-hydrogen"]
+    models = list(candidate_models or ["gemini-4-hydrogen"])
+    deadline = time.monotonic() + float(total_budget)
     attempts_per_model = 1 + max_retries_single if len(models) == 1 else 1
     last_err = {"kind": "internal", "code": 500, "message": "Unknown Gemini upstream failure"}
+    tried = set()
+    discovered_checked = False
 
-    for idx, model_name in enumerate(models):
+    def _try_model(model_name, max_attempts):
+        nonlocal last_err
         endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
-        for attempt in range(attempts_per_model):
+        for attempt in range(max_attempts):
+            remaining = deadline - time.monotonic()
+            if remaining <= 1.0:
+                return None, True
+            req_timeout = min(float(timeout), max(2.0, remaining))
             req = urllib.request.Request(
                 endpoint,
                 data=payload_bytes,
@@ -86,12 +184,12 @@ def call_gemini_with_fallback(api_key, candidate_models, gemini_payload, timeout
                 method='POST'
             )
             try:
-                with urllib.request.urlopen(req, timeout=timeout) as response:
+                with urllib.request.urlopen(req, timeout=req_timeout) as response:
                     result_bytes = response.read()
                 parsed = json.loads(result_bytes.decode('utf-8'))
                 if not isinstance(parsed, dict):
                     raise ValueError("Gemini API returned non-object JSON payload")
-                return parsed, model_name, None
+                return parsed, False
             except urllib.error.HTTPError as he:
                 error_body = he.read().decode('utf-8', errors='ignore')
                 err_msg = f"Gemini API HTTP {he.code}"
@@ -103,23 +201,44 @@ def call_gemini_with_fallback(api_key, candidate_models, gemini_payload, timeout
                         err_msg = f"Gemini API error ({he.code}): {error_body[:200]}"
                 last_err = {"kind": "http", "code": he.code, "message": err_msg}
                 if he.code not in TRANSIENT_HTTP_CODES:
-                    return None, model_name, last_err
-                if attempt < attempts_per_model - 1:
+                    return None, True
+                if attempt < max_attempts - 1 and (deadline - time.monotonic()) > 2.0:
                     time.sleep(0.5)
                     continue
-                if idx < len(models) - 1:
-                    break
+                return None, False
             except (urllib.error.URLError, TimeoutError, socket.timeout) as ne:
                 detail = getattr(ne, 'reason', None) or str(ne)
                 last_err = {"kind": "network", "code": 504, "message": str(detail)}
-                if attempt < attempts_per_model - 1:
+                if attempt < max_attempts - 1 and (deadline - time.monotonic()) > 2.0:
                     time.sleep(0.5)
                     continue
-                if idx < len(models) - 1:
-                    break
+                return None, False
             except Exception as ex:
                 last_err = {"kind": "internal", "code": 500, "message": str(ex)}
-                return None, model_name, last_err
+                return None, True
+        return None, False
+
+    for model_name in models:
+        tried.add(model_name)
+        parsed, stop_now = _try_model(model_name, attempts_per_model)
+        if parsed is not None:
+            return parsed, model_name, None
+        if stop_now:
+            return None, model_name, last_err
+
+    if discover_on_exhaust and not discovered_checked and (deadline - time.monotonic()) >= 4.0:
+        discovered_checked = True
+        extra_models = [
+            m for m in discover_gemini_models(api_key, timeout=min(5.0, max(2.0, deadline - time.monotonic())))
+            if m not in tried
+        ][:3]
+        for extra_model in extra_models:
+            tried.add(extra_model)
+            parsed, stop_now = _try_model(extra_model, 1)
+            if parsed is not None:
+                return parsed, extra_model, None
+            if stop_now:
+                return None, extra_model, last_err
 
     return None, models[-1], last_err
 
@@ -741,7 +860,7 @@ class NutriSnapHandler(http.server.SimpleHTTPRequestHandler):
                 active_key,
                 candidate_models,
                 gemini_payload,
-                timeout=20
+                timeout=12
             )
             if err_info is not None:
                 self._send_upstream_gemini_error(err_info, "Gemini API")
@@ -845,7 +964,7 @@ class NutriSnapHandler(http.server.SimpleHTTPRequestHandler):
                 active_key,
                 candidate_guide_models,
                 gemini_payload,
-                timeout=20
+                timeout=12
             )
             if err_info is not None:
                 self._send_upstream_gemini_error(err_info, "NutriGuide assistant")
