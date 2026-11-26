@@ -342,6 +342,39 @@ YOUTH_SAFETY_REGEX = re.compile(
     re.IGNORECASE
 )
 
+def validate_vision_document(document, label=False):
+    """Reject malformed model structures before returning a successful scan."""
+    if not isinstance(document, dict):
+        raise ValueError("Expected a JSON object")
+    text_fields = (
+        ("title", "productName", "brand", "servingSize", "servingUnit", "measurementBasis", "ingredients", "storageInstructions")
+        if label else ("title", "category", "notes", "source")
+    )
+    if any(document.get(field) is not None and not isinstance(document[field], str) for field in text_fields):
+        raise ValueError("Invalid text field")
+    flags = ("isLabel", "isFood") if label else ("isFood", "noFoodDetected", "isWater")
+    if any(document.get(field) is not None and type(document[field]) is not bool for field in flags):
+        raise ValueError("Invalid scan flag")
+    if label:
+        for field in ("declaredAllergens", "possibleTraces", "uncertainFields"):
+            values = document.get(field)
+            if values is not None and (not isinstance(values, list) or any(not isinstance(value, str) for value in values)):
+                raise ValueError("Invalid label list")
+        return
+    if document.get("isFood") is False or document.get("noFoodDetected") is True:
+        document["items"] = []
+        return
+    items = document.get("items")
+    if not isinstance(items, list):
+        raise ValueError("Expected a food item list")
+    document["items"] = [
+        item for item in items
+        if isinstance(item, dict) and isinstance(item.get("name"), str) and item["name"].strip()
+        and all(item.get(field) is None or isinstance(item[field], str) for field in ("unit", "servingUnit"))
+    ]
+    if not document["items"]:
+        raise ValueError("No valid named food items")
+
 def build_nutriguide_request(payload):
     """Validate and construct a safe, educational Gemini request payload for NutriGuide."""
     if not isinstance(payload, dict):
@@ -556,7 +589,7 @@ class NutriSnapHandler(http.server.SimpleHTTPRequestHandler):
                 "service": "NutriSnap AI Backend",
                 "status": "ok",
                 "mode": "backend-only",
-                "version": "1.5.4",
+                "version": "1.5.5",
                 "hasBackendKey": has_env_key,
                 "defaultModel": "gemini-4-hydrogen",
                 "endpoints": [
@@ -672,7 +705,7 @@ class NutriSnapHandler(http.server.SimpleHTTPRequestHandler):
             self.send_json(200, {
                 "status": "healthy" if path_only == '/api/health' else "ok",
                 "healthy": True,
-                "version": "1.5.4",
+                "version": "1.5.5",
                 "hasBackendKey": bool(has_env_key),
                 "modelConfigValid": bool(model_config_valid),
                 "defaultModel": default_model,
@@ -978,8 +1011,7 @@ class NutriSnapHandler(http.server.SimpleHTTPRequestHandler):
                 clean_text = clean_text.strip()
 
                 parsed_result = json.loads(clean_text)
-                if not isinstance(parsed_result, dict):
-                    raise ValueError("Gemini model returned non-object JSON payload")
+                validate_vision_document(parsed_result, label=scan_type == "nutrition_label")
                 parsed_result["source"] = f"Gemini Vision Proxy ({used_model})"
 
                 if scan_type == "nutrition_label":
@@ -1000,17 +1032,13 @@ class NutriSnapHandler(http.server.SimpleHTTPRequestHandler):
                     if "coordinate_format" not in parsed_result:
                         parsed_result["coordinate_format"] = "normalized_0_to_1000"
 
-                    # Ensure items array structure
-                    if not isinstance(parsed_result.get("items"), list):
-                        parsed_result["items"] = []
-
                 self.send_json(200, parsed_result)
                 return
-            except Exception as parse_err:
+            except (ValueError, TypeError):
                 self.send_json_error(
-                    500,
-                    f"Internal meal analysis error: {_redact_secrets(parse_err)}",
-                    error_type="server_error"
+                    502,
+                    "The AI service returned an invalid scan response. Please try again.",
+                    error_type="invalid_response"
                 )
                 return
 
