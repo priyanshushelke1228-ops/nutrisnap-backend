@@ -589,7 +589,7 @@ class NutriSnapHandler(http.server.SimpleHTTPRequestHandler):
                 "service": "NutriSnap AI Backend",
                 "status": "ok",
                 "mode": "backend-only",
-                "version": "1.5.10",
+                "version": "1.5.11",
                 "hasBackendKey": has_env_key,
                 "defaultModel": "gemini-4-hydrogen",
                 "endpoints": [
@@ -652,7 +652,7 @@ class NutriSnapHandler(http.server.SimpleHTTPRequestHandler):
     <h1>NutriSnap AI — Backend API</h1>
     <p>This service runs in <strong>backend-only</strong> mode for the NutriSnap mobile and web clients. No web UI or directory listing is served at <code>/</code>.</p>
     <div class="row">
-      <span class="badge ok">API Online · v1.5.1</span>
+      <span class="badge ok">API Online · v1.5.11</span>
       {key_badge}
     </div>
     <ul>
@@ -705,7 +705,7 @@ class NutriSnapHandler(http.server.SimpleHTTPRequestHandler):
             self.send_json(200, {
                 "status": "healthy" if path_only == '/api/health' else "ok",
                 "healthy": True,
-                "version": "1.5.10",
+                "version": "1.5.11",
                 "hasBackendKey": bool(has_env_key),
                 "modelConfigValid": bool(model_config_valid),
                 "defaultModel": default_model,
