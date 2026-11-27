@@ -852,13 +852,12 @@ class NutriSnapHandler(http.server.SimpleHTTPRequestHandler):
                 }).encode('utf-8'))
                 return
 
-            # 5. Model Validation & Migration
-            raw_model = payload.get("model")
-            requested_model = (raw_model.strip() if isinstance(raw_model, str) else "") or "gemini-4-hydrogen"
-            if requested_model in LEGACY_MODEL_MAP:
-                selected_model = LEGACY_MODEL_MAP[requested_model]
-            elif requested_model in SUPPORTED_MODELS:
-                selected_model = SUPPORTED_MODELS[requested_model]
+            # 5. Server-Side Model Configuration (ignore client overrides)
+            configured_vision_model = os.environ.get("GEMINI_VISION_MODEL", "").strip() or "gemini-4-hydrogen"
+            if configured_vision_model in LEGACY_MODEL_MAP:
+                selected_model = LEGACY_MODEL_MAP[configured_vision_model]
+            elif configured_vision_model in SUPPORTED_MODELS:
+                selected_model = SUPPORTED_MODELS[configured_vision_model]
             else:
                 selected_model = "gemini-4-hydrogen"
 
